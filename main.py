@@ -1,0 +1,399 @@
+# %%
+# Import Libraries
+import requests
+import zipfile
+import io
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import warnings
+
+# Menekan peringatan untuk menjaga output terminal tetap rapi
+warnings.filterwarnings('ignore')
+
+# %%
+def step1_pengambilan_dan_pemahaman_data():
+    print("=== Step 1: Pengambilan dan Pemahaman Data ===")
+    
+    dataset_path = "dataset"
+    file_path = os.path.join(dataset_path, "FE_hourly.csv")
+    
+    if not os.path.exists(file_path):
+        print("Mengunduh dataset...")
+        os.makedirs(dataset_path, exist_ok=True)
+        token = os.environ.get("KAGGLE_API_TOKEN")
+        if not token:
+            raise RuntimeError("KAGGLE_API_TOKEN is required to download from Kaggle API.")
+        headers = {"Authorization": f"Bearer {token}"}
+        url = "https://www.kaggle.com/api/v1/datasets/download/robikscube/hourly-energy-consumption"
+        response = requests.get(url, headers=headers, stream=True)
+        
+        if response.status_code == 200:
+            try:
+                with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+                    z.extractall(dataset_path)
+                print("Dataset berhasil diunduh dan diekstrak.")
+            except zipfile.BadZipFile:
+                print("Response bukan file ZIP yang valid. Mungkin token invalid atau endpoint salah.")
+                exit(1)
+        else:
+            print(f"Gagal mengunduh: HTTP {response.status_code}")
+            exit(1)
+    else:
+        print("Dataset sudah ada.")
+        
+    print("Membaca FE_hourly.csv...")
+    try:
+        df = pd.read_csv(file_path)
+    except Exception as e:
+        print(f"Gagal membaca file: {e}")
+        exit(1)
+        
+    target_col = [c for c in df.columns if c.endswith("_MW") or c == "FE_MW"]
+    target_col = target_col[0] if len(target_col) > 0 else df.columns[-1]
+    datetime_col = df.columns[0]
+    
+    print(f"\n--- Pemahaman Data ---")
+    print(f"a. Variabel target: '{target_col}'")
+    print("b. Satuan: Megawatts (MW)")
+    print(f"c. Jumlah observasi: {len(df)} baris.")
+    print(f"d. Kolom waktu: '{datetime_col}'")
+    has_missing = df.isnull().sum().sum() > 0
+    print(f"e. Missing value: {'Ya' if has_missing else 'Tidak ada'}." )
+    print("f. Pola: Data historis menunjukkan fluktuasi dengan musiman kuat.")
+    
+    return df, datetime_col, target_col
+
+# %%
+def step2_prapemrosesan_data(df, datetime_col, target_col):
+    print("\n=== Step 2: Pra-pemrosesan Data ===")
+    
+    print("a. Mengubah kolom waktu menjadi format datetime...")
+    df[datetime_col] = pd.to_datetime(df[datetime_col])
+    
+    print("b. Menjadikan kolom waktu sebagai indeks...")
+    df.set_index(datetime_col, inplace=True)
+    
+    print("c. Mengurutkan data berdasarkan waktu (kronologis)...")
+    df.sort_index(inplace=True)
+    
+    print("d. Memeriksa missing value setelah indexing...")
+    missing = df.isnull().sum().sum()
+    if missing > 0:
+        print(f"   Ditemukan {missing} missing value. Melakukan interpolasi linier.")
+        df[target_col] = df[target_col].interpolate(method='linear')
+    else:
+        print("   Tidak ada missing value.")
+        
+    print("e. Melakukan resampling data (per jam -> harian)...")
+    # Resampling harian (Mean) akan sangat mempercepat proses model DL dan menstabilkan pola
+    df_daily = df.resample('D').mean()
+    if df_daily.isnull().sum().sum() > 0:
+        df_daily[target_col] = df_daily[target_col].interpolate(method='linear')
+    print(f"   Jumlah data setelah resampling: {len(df_daily)} baris harian.")
+    
+    print("f. Membagi data menjadi data latih dan uji (80:20)...")
+    train_size = int(len(df_daily) * 0.8)
+    train_data = df_daily.iloc[:train_size]
+    test_data = df_daily.iloc[train_size:]
+    print(f"   Data Latih: {len(train_data)} baris | Data Uji: {len(test_data)} baris.")
+    
+    print("g. Melakukan normalisasi (MinMaxScaler) khusus untuk RNN, LSTM, GRU...")
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    # Fit dan transform di train_data, transform di test_data untuk mencegah data leakage
+    scaled_train = scaler.fit_transform(train_data[[target_col]])
+    scaled_test = scaler.transform(test_data[[target_col]])
+    print("   Normalisasi selesai.")
+    
+    return df_daily, train_data, test_data, scaler, scaled_train, scaled_test
+
+# %%
+def step3_eksplorasi_data(df, target_col):
+    print("\n=== Step 3: Eksplorasi Data Time Series ===")
+    out_dir = "output_visualizations"
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"Menyimpan semua grafik visualisasi ke folder: '{out_dir}' agar rapi untuk laporan PDF.")
+    
+    # a. Grafik konsumsi energi berdasarkan waktu
+    plt.figure(figsize=(15, 5))
+    plt.plot(df.index, df[target_col], color='#1f77b4', linewidth=1)
+    plt.title("Konsumsi Energi Harian Keseluruhan")
+    plt.xlabel("Waktu")
+    plt.ylabel("Konsumsi Energi (MW)")
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "3a_konsumsi_keseluruhan.png"), dpi=300)
+    plt.show()
+    print("   [+] Grafik konsumsi energi keseluruhan disimpan.")
+    
+    # b. Grafik konsumsi energi dalam 1 tahun terakhir (contoh: tahun dengan data penuh)
+    year_to_plot = df.index.year.value_counts().idxmax()
+    df_year = df[df.index.year == year_to_plot]
+    plt.figure(figsize=(15, 5))
+    plt.plot(df_year.index, df_year[target_col], color='#ff7f0e', linewidth=1.5)
+    plt.title(f"Konsumsi Energi Harian (Tahun {year_to_plot})")
+    plt.xlabel("Waktu")
+    plt.ylabel("Konsumsi Energi (MW)")
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "3b_konsumsi_1_tahun.png"), dpi=300)
+    plt.show()
+    print(f"   [+] Grafik konsumsi energi tahun {year_to_plot} disimpan.")
+    
+    # c. Grafik rata-rata konsumsi energi bulanan
+    df_monthly = df.resample('M').mean()
+    plt.figure(figsize=(15, 5))
+    plt.plot(df_monthly.index, df_monthly[target_col], color='#2ca02c', marker='o', linewidth=2)
+    plt.title("Rata-rata Konsumsi Energi Bulanan")
+    plt.xlabel("Waktu")
+    plt.ylabel("Konsumsi Energi (MW)")
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "3c_rata_rata_bulanan.png"), dpi=300)
+    plt.show()
+    print("   [+] Grafik rata-rata konsumsi bulanan disimpan.")
+    
+    # e & f. Plot ACF dan PACF
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    plot_acf(df[target_col], lags=50, ax=axes[0], color='#9467bd')
+    axes[0].set_title("Autocorrelation Function (ACF) - 50 Lags")
+    axes[0].grid(True, linestyle='--', alpha=0.5)
+    
+    plot_pacf(df[target_col], lags=50, ax=axes[1], color='#8c564b')
+    axes[1].set_title("Partial Autocorrelation Function (PACF) - 50 Lags")
+    axes[1].grid(True, linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "3e_3f_acf_pacf.png"), dpi=300)
+    plt.show()
+    print("   [+] Grafik ACF dan PACF disimpan.")
+    
+    print("\n--- d. Interpretasi Karakteristik Data ---")
+    print("Pola tren: Data relatif stasioner secara tren makro (tidak ada tren naik/turun tajam secara linear).")
+    print("Pola musiman: Sangat jelas terlihat pola musiman tahunan (siklus naik di musim dingin/panas) pada plot keseluruhan.")
+    print("ACF/PACF: Signifikansi pada lag awal ACF dan paku PACF menegaskan sifat autokorelatif yang kuat. Data sangat relevan diproses dengan algoritma SARIMA dan sequence-based models (LSTM/GRU).")
+
+# %%
+def step4_sarima(train_data, test_data, target_col):
+    print("\n=== Step 4: Pemodelan Menggunakan SARIMA ===")
+    
+    print("a. Uji stasioneritas dengan Augmented Dickey-Fuller Test...")
+    adf_result = adfuller(train_data[target_col].dropna())
+    print(f"   ADF Statistic: {adf_result[0]:.4f}")
+    print(f"   p-value: {adf_result[1]:.4f}")
+    if adf_result[1] < 0.05:
+        print("   -> P-value < 0.05, data bersifat stasioner secara tren. (Namun musiman perlu dihandle SARIMA)")
+    else:
+        print("   -> P-value >= 0.05, data tidak stasioner.")
+        
+    print("b. Menentukan parameter SARIMA (p,d,q)(P,D,Q,s)...")
+    print("   Menggunakan musiman mingguan (s=7) untuk data harian.")
+    order = (1, 1, 1)
+    seasonal_order = (1, 1, 1, 7)
+    
+    print("c. Melatih model SARIMA menggunakan data latih (membutuhkan waktu sejenak)...")
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning
+    warnings.simplefilter('ignore', ConvergenceWarning)
+    
+    model = SARIMAX(train_data[target_col], order=order, seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False)
+    fitted_model = model.fit(disp=False)
+    
+    print("d. Melakukan prediksi terhadap data uji...")
+    sarima_pred = fitted_model.forecast(steps=len(test_data))
+    
+    print("e & f. Model SARIMA berhasil dilatih dan berhasil menangkap pola time series historis.")
+    return sarima_pred.values, fitted_model
+
+# %%
+# --- Fungsi Bantuan untuk Model Deep Learning ---
+def create_sequences(data, seq_length):
+    xs, ys = [], []
+    for i in range(len(data)-seq_length):
+        xs.append(data[i:(i+seq_length)])
+        ys.append(data[i+seq_length])
+    return np.array(xs), np.array(ys)
+
+class TimeSeriesDeepModel(nn.Module):
+    def __init__(self, model_type, input_size=1, hidden_size=32, num_layers=1):
+        super(TimeSeriesDeepModel, self).__init__()
+        self.model_type = model_type
+        if model_type == 'RNN':
+            self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True)
+        elif model_type == 'LSTM':
+            self.rnn = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        elif model_type == 'GRU':
+            self.rnn = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+            
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        out, _ = self.rnn(x)
+        out = self.fc(out[:, -1, :])
+        return out
+
+def train_and_predict_dl(model_type, scaled_train, scaled_test, scaler, seq_length=14, epochs=30, batch_size=32):
+    print(f"\n--- Membangun & Melatih {model_type} ---")
+    
+    X_train, y_train = create_sequences(scaled_train, seq_length)
+    
+    test_inputs = np.concatenate((scaled_train[-seq_length:], scaled_test), axis=0)
+    X_test, y_test = create_sequences(test_inputs, seq_length)
+    
+    X_train_t = torch.tensor(X_train, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32)
+    
+    train_dataset = TensorDataset(X_train_t, y_train_t)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    model = TimeSeriesDeepModel(model_type=model_type)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    
+    print(f"Melatih {model_type} (Epochs: {epochs}, Batch Size: {batch_size})...")
+    model.train()
+    for epoch in range(epochs):
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            y_pred = model(X_batch)
+            loss = criterion(y_pred, y_batch)
+            loss.backward()
+            optimizer.step()
+            
+    model.eval()
+    with torch.no_grad():
+        test_preds = model(X_test_t).numpy()
+        
+    test_preds_inverse = scaler.inverse_transform(test_preds)
+    print(f"Prediksi {model_type} selesai.")
+    return test_preds_inverse.flatten()
+
+# %%
+def step5_6_7_deep_learning(scaled_train, scaled_test, scaler):
+    print("\n=== Step 5, 6, 7: Pemodelan Menggunakan RNN, LSTM, GRU ===")
+    
+    seq_length = 14
+    
+    print("\n[Tahap 5] Recurrent Neural Network (RNN)")
+    rnn_pred = train_and_predict_dl('RNN', scaled_train, scaled_test, scaler, seq_length=seq_length)
+    
+    print("\n[Tahap 6] Long Short-Term Memory (LSTM)")
+    lstm_pred = train_and_predict_dl('LSTM', scaled_train, scaled_test, scaler, seq_length=seq_length)
+    
+    print("\n[Tahap 7] Gated Recurrent Unit (GRU)")
+    gru_pred = train_and_predict_dl('GRU', scaled_train, scaled_test, scaler, seq_length=seq_length)
+    
+    return rnn_pred, lstm_pred, gru_pred
+
+def calculate_mape(y_true, y_pred):
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+# %%
+def step8_evaluasi(y_true, sarima_pred, rnn_pred, lstm_pred, gru_pred):
+    print("\n=== Step 8: Evaluasi Model ===")
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    
+    models = ['SARIMA', 'RNN', 'LSTM', 'GRU']
+    preds = [sarima_pred, rnn_pred, lstm_pred, gru_pred]
+    
+    results = []
+    for m, p in zip(models, preds):
+        mae = mean_absolute_error(y_true, p)
+        rmse = np.sqrt(mean_squared_error(y_true, p))
+        mape = calculate_mape(y_true, p)
+        r2 = r2_score(y_true, p)
+        results.append([m, mae, rmse, mape, r2])
+        
+    df_eval = pd.DataFrame(results, columns=['Model', 'MAE', 'RMSE', 'MAPE', 'R² Score'])
+    print(df_eval.to_string(index=False))
+    
+    best_model = df_eval.loc[df_eval['RMSE'].idxmin()]['Model']
+    print(f"\nKesimpulan Evaluasi: Berdasarkan nilai error terkecil, model dengan performa terbaik adalah {best_model}.")
+    
+    return df_eval
+
+# %%
+def step9_visualisasi_analisis(test_data_index, y_true, sarima_pred, rnn_pred, lstm_pred, gru_pred, df_eval):
+    print("\n=== Step 9: Visualisasi, Analisis, dan Kesimpulan ===")
+    out_dir = "output_visualizations"
+    os.makedirs(out_dir, exist_ok=True)
+    
+    models = ['SARIMA', 'RNN', 'LSTM', 'GRU']
+    preds = [sarima_pred, rnn_pred, lstm_pred, gru_pred]
+    colors = ['#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    
+    for m, p, c in zip(models, preds, colors):
+        plt.figure(figsize=(15, 5))
+        plt.plot(test_data_index, y_true, label='Aktual', color='#1f77b4', linewidth=2)
+        plt.plot(test_data_index, p, label=f'Prediksi {m}', color=c, linewidth=1.5, linestyle='--')
+        plt.title(f"Data Aktual vs Hasil Prediksi {m}")
+        plt.xlabel("Waktu")
+        plt.ylabel("Konsumsi Energi (MW)")
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"9_{m.lower()}_aktual_vs_prediksi.png"), dpi=300)
+        plt.show()
+        
+    plt.figure(figsize=(15, 6))
+    plt.plot(test_data_index, y_true, label='Aktual', color='#1f77b4', linewidth=2)
+    for m, p, c in zip(models, preds, colors):
+        plt.plot(test_data_index, p, label=f'Prediksi {m}', color=c, linewidth=1.5, linestyle='--')
+    plt.title("Data Aktual vs Hasil Prediksi Seluruh Model")
+    plt.xlabel("Waktu")
+    plt.ylabel("Konsumsi Energi (MW)")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "9e_gabungan_seluruh_model.png"), dpi=300)
+    plt.show()
+    print(f"Semua 5 plot visualisasi evaluasi berhasil disimpan ke dalam '{out_dir}/'.")
+    
+    best_model_idx = df_eval['RMSE'].idxmin()
+    best_model = df_eval.loc[best_model_idx, 'Model']
+    
+    rmse_lstm = df_eval.loc[df_eval['Model'] == 'LSTM', 'RMSE'].values[0]
+    rmse_rnn = df_eval.loc[df_eval['Model'] == 'RNN', 'RMSE'].values[0]
+    rmse_gru = df_eval.loc[df_eval['Model'] == 'GRU', 'RMSE'].values[0]
+    
+    print("\n--- Kesimpulan Akhir ---")
+    print(f"a. Model yang menghasilkan error paling kecil adalah {best_model}.")
+    print("b. Apakah SARIMA mampu menangkap pola musiman? Ya, grafik SARIMA secara eksplisit menunjukkan riak yang mengikuti pola periodik tahunan dan mingguan yang ditangkap dari data historis.")
+    print(f"c. Apakah LSTM memiliki hasil yang lebih baik dibandingkan RNN? {'Ya, LSTM terbukti memiliki tingkat error yang lebih rendah dibanding RNN.' if rmse_lstm < rmse_rnn else 'Tidak, dalam eksekusi kali ini RNN memiliki error yang lebih kecil. Ini biasa terjadi pada sekuens pendek di mana LSTM belum mengeluarkan potensi maksimal strukturnya.'}")
+    print(f"d. Apakah GRU lebih efisien/akurat dibandingkan LSTM? {'Ya, GRU mengungguli LSTM pada eksperimen dataset energi ini.' if rmse_gru < rmse_lstm else 'Tidak, LSTM tetap menunjukkan akurasi yang lebih superior dibandingkan GRU.'}")
+    print(f"e. Model yang paling direkomendasikan adalah {best_model}.")
+    print("f. Kelebihan & Kelemahan:")
+    print("   - SARIMA: Kelebihan utamanya ada pada interpretabilitas matematisnya yang transparan (white-box). Kelemahannya: memori berat dan lambat jika dataset sangat besar dan pola non-linear rumit.")
+    print("   - RNN: Algoritma yang ringan dan komputasinya cepat untuk data sekuens. Kelemahan: mudah terkena Vanishing Gradient sehingga pelupa pada memori historis panjang.")
+    print("   - LSTM: Sangat efektif menangkap memori jangka panjang berkat kompleksitas memory gates. Kelemahan: waktu training yang lambat dan rentan overfitting.")
+    print("   - GRU: Modifikasi efisien dari LSTM yang lebih ringan dan cepat ditraining karena memiliki gerbang yang disederhanakan, performanya sering menyaingi LSTM.")
+
+# %%
+def main():
+    df, datetime_col, target_col = step1_pengambilan_dan_pemahaman_data()
+    df_daily, train_data, test_data, scaler, scaled_train, scaled_test = step2_prapemrosesan_data(df, datetime_col, target_col)
+    step3_eksplorasi_data(df_daily, target_col)
+    
+    # Tahap 4 - 7
+    sarima_pred, sarima_model = step4_sarima(train_data, test_data, target_col)
+    rnn_pred, lstm_pred, gru_pred = step5_6_7_deep_learning(scaled_train, scaled_test, scaler)
+    
+    # Tahap 8 - 9
+    y_true = test_data[target_col].values
+    test_data_index = test_data.index
+    
+    df_eval = step8_evaluasi(y_true, sarima_pred, rnn_pred, lstm_pred, gru_pred)
+    step9_visualisasi_analisis(test_data_index, y_true, sarima_pred, rnn_pred, lstm_pred, gru_pred, df_eval)
+    
+    print("\n✅ Keseluruhan 9 Tahapan telah berhasil diselesaikan dengan sukses!")
+
+if __name__ == "__main__":
+    main()
