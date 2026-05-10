@@ -1,0 +1,9 @@
+dataset/
+dataset_walmart/
+output_visualizations/
+venv/
+.venv/
+.ipynb_checkpoints/
+*.pdf
+*.docx
+*.png
