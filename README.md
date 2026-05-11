@@ -1,4 +1,5 @@
 # Research Forecasting
+![License](https://img.shields.io/github/license/azcharia/research-forecasting)
 
 This folder contains time-series forecasting experiments (SARIMA, RNN, LSTM, GRU) and notebooks for analysis.
 
